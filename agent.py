@@ -188,6 +188,14 @@ def default_config() -> dict:
         "auto_approve": False,
         "max_tool_steps": 20,
         "shell_timeout": 120,
+        "context_compress": {
+            "enabled": True,
+            "threshold_tokens": COMPRESS_DEFAULT_THRESHOLD,
+            "keep_recent_messages": 6,
+            "max_rounds": 4,
+            "summarize_input_chars": 60000,
+            "shrink_tool_output_chars": 1200,
+        },
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
         "usage_log": str(AGENT_HOME / "usage.jsonl"),
         "providers": {
@@ -372,6 +380,84 @@ def estimate_tokens(text: str) -> int:
     cjk = len(re.findall(r"[\u3400-\u9fff\u3000-\u303f\uff00-\uffef]", text))
     other = max(0, len(text) - cjk)
     return max(1, int(cjk * 1.1 + other / 3.6))
+
+
+COMPRESS_DEFAULT_THRESHOLD = 186 * 1024
+
+COMPRESS_SYSTEM_PROMPT = (
+    "你是一个对话上下文压缩器。请把给出的历史对话压缩成一段简洁的中文摘要，供后续对话继续使用。\n"
+    "必须保留：用户的目标与偏好、已经确认的结论与决定、涉及的文件路径与关键命令、尚未完成的事项。\n"
+    "可以丢弃：寒暄客套、重复表述、冗长的命令输出与工具原始结果。\n"
+    "只输出摘要正文，不要标题、不要解释，不超过 800 字。"
+)
+
+
+def estimate_messages_tokens(messages: list, system_prompt: str = "", tools: list | None = None) -> int:
+    """估算一次请求的输入 token 总量（系统提示词 + 消息 + 工具定义）。"""
+    parts = [system_prompt or ""]
+    for message in messages or []:
+        parts.append(str(message.get("content") or ""))
+        calls = message.get("tool_calls")
+        if calls:
+            parts.append(json.dumps(calls, ensure_ascii=False))
+        blocks = message.get("_anthropic_blocks")
+        if blocks:
+            parts.append(json.dumps(blocks, ensure_ascii=False))
+    if tools:
+        parts.append(json.dumps(tools, ensure_ascii=False))
+    return estimate_tokens("\n".join(parts))
+
+
+def render_transcript(messages: list, tool_limit: int = 400) -> str:
+    """把消息列表渲染成纯文本，供摘要模型阅读或被规则摘要使用。"""
+    lines = []
+    for message in messages or []:
+        role = message.get("role")
+        content = str(message.get("content") or "")
+        if role == "user":
+            lines.append("【用户】" + content)
+        elif role == "assistant":
+            if content:
+                lines.append("【助手】" + content)
+            for call in message.get("tool_calls") or []:
+                lines.append(
+                    "【助手调用工具】%s %s"
+                    % (call.get("name") or "?", compact(call.get("arguments") or {}, 200))
+                )
+        elif role == "tool":
+            lines.append("【工具 %s 结果】%s" % (message.get("name") or "?", compact(content, tool_limit)))
+    return "\n".join(lines)
+
+
+def fallback_summary(messages: list) -> str:
+    """摘要模型不可用时的规则摘要。"""
+    requests = [str(m.get("content") or "").strip() for m in messages or [] if m.get("role") == "user"]
+    tools = {}
+    for message in messages or []:
+        if message.get("role") == "tool":
+            name = message.get("name") or "?"
+            tools[name] = tools.get(name, 0) + 1
+    parts = []
+    if requests:
+        parts.append("用户在此前对话中提出的请求：")
+        for text in requests[-10:]:
+            parts.append("- " + compact(text, 120))
+    if tools:
+        parts.append("已调用的工具：" + "、".join(f"{name}×{count}" for name, count in tools.items()))
+    return "\n".join(parts) or "此前对话无可保留内容。"
+
+
+def merge_summary(previous: str, addition: str, limit: int = 4000) -> str:
+    previous = (previous or "").strip()
+    addition = (addition or "").strip()
+    if not previous:
+        return addition[:limit]
+    if not addition:
+        return previous
+    merged = previous + "\n" + addition
+    if len(merged) > limit:
+        merged = "…（更早的摘要已省略）\n" + merged[-(limit - 12):]
+    return merged
 
 
 def compact(value, limit: int = 160) -> str:
@@ -903,11 +989,27 @@ class Agent:
         self.event_sink = event_sink
         self.system_prompt = cfg.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
         self.turn_constraint = ""
+        self.context_summary = ""
+        self.archive = []
+        self._compress_usage = {"requests": 0, "prompt": 0, "completion": 0, "cached": 0}
         log_path = expand(cfg.get("usage_log") or (AGENT_HOME / "usage.jsonl"))
         session_id = session_id or (datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6])
         self.usage = UsageTracker(log_path, session_id)
         self._key_cache = {}
         self.model = self._model()
+
+    def _system_prompt(self) -> str:
+        """系统提示词 + 压缩摘要 + 本轮临时约束。"""
+        prompt = self.system_prompt
+        if self.context_summary:
+            prompt = (
+                prompt
+                + "\n\n【历史对话摘要】此前对话已被压缩，摘要如下，请把它当作已发生的事实：\n"
+                + self.context_summary
+            )
+        if self.turn_constraint:
+            prompt = prompt + "\n\n【本轮约束】" + self.turn_constraint
+        return prompt
 
     def _model(self) -> dict:
         return self.models[self.alias]
@@ -947,6 +1049,7 @@ class Agent:
         alias: str | None = None,
         force_no_thinking: bool = False,
         thinking: bool | None = None,
+        system_override: str | None = None,
     ) -> dict:
         target_alias = alias or self.alias
         model_cfg = self.models[target_alias]
@@ -956,9 +1059,7 @@ class Agent:
         )
         protocol = (provider.get("protocol") or "openai").lower()
         tools = TOOL_DEFS if (with_tools and self.tools_enabled) else []
-        system_prompt = self.system_prompt
-        if self.turn_constraint:
-            system_prompt = system_prompt + "\n\n【本轮约束】" + self.turn_constraint
+        system_prompt = self._system_prompt() if system_override is None else system_override
         thinking_enabled = bool(model_cfg.get("thinking_default")) if thinking is None else bool(thinking)
         extra_body = None
         if force_no_thinking:
@@ -970,14 +1071,7 @@ class Agent:
         configured_max = int(max_tokens or model_cfg.get("max_tokens") or 8192)
         max_context = int(model_cfg.get("max_context") or 0)
         if model_cfg.get("max_tokens_from_context") and max_context:
-            prompt_parts = [system_prompt]
-            for message in messages:
-                prompt_parts.append(str(message.get("content") or ""))
-                if message.get("tool_calls"):
-                    prompt_parts.append(json.dumps(message["tool_calls"], ensure_ascii=False))
-            if tools:
-                prompt_parts.append(json.dumps(tools, ensure_ascii=False))
-            prompt_estimate = estimate_tokens("\n".join(prompt_parts))
+            prompt_estimate = estimate_messages_tokens(messages, system_prompt, tools)
             configured_max = min(configured_max, max(1024, max_context - prompt_estimate - 8192))
         if thinking_enabled and not force_no_thinking:
             configured_max = min(configured_max, int(model_cfg.get("thinking_max_tokens") or configured_max))
@@ -1004,12 +1098,7 @@ class Agent:
         estimated = False
         if not usage:
             estimated = True
-            prompt_text = [system_prompt]
-            for message in messages:
-                prompt_text.append(str(message.get("content") or ""))
-                if message.get("tool_calls"):
-                    prompt_text.append(json.dumps(message["tool_calls"], ensure_ascii=False))
-            prompt_estimate = estimate_tokens("\n".join(prompt_text))
+            prompt_estimate = estimate_messages_tokens(messages, system_prompt, tools)
             usage = {
                 "prompt_tokens": prompt_estimate,
                 "completion_tokens": estimate_tokens(reply.get("text") or ""),
@@ -1037,6 +1126,7 @@ class Agent:
             max_tokens=max_tokens,
             alias=target_alias,
             force_no_thinking=True,
+            system_override=system_override,
         )
         retry_record = retry["record"]
         combined = {
@@ -1265,8 +1355,186 @@ class Agent:
             pass
         return True
 
+    def _compress_settings(self) -> dict:
+        raw = self.cfg.get("context_compress") or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        threshold = raw.get("threshold_tokens")
+        try:
+            threshold = int(threshold or COMPRESS_DEFAULT_THRESHOLD)
+        except (TypeError, ValueError):
+            threshold = COMPRESS_DEFAULT_THRESHOLD
+        return {
+            "enabled": raw.get("enabled", True) is not False,
+            "threshold": max(1024, threshold),
+            "keep_recent": max(2, int(raw.get("keep_recent_messages") or 6)),
+            "max_rounds": max(1, int(raw.get("max_rounds") or 4)),
+            "summarize_chars": max(4000, int(raw.get("summarize_input_chars") or 60000)),
+            "shrink_chars": max(200, int(raw.get("shrink_tool_output_chars") or 1200)),
+        }
+
+    def context_tokens(self) -> int:
+        """当前上下文的估算 token 数（与真实请求口径一致）。"""
+        tools = TOOL_DEFS if self.tools_enabled else []
+        return estimate_messages_tokens(self.messages, self._system_prompt(), tools)
+
+    def _summarize_messages(self, chunk: list) -> str:
+        """让模型把一段历史压缩成摘要；失败时退回规则摘要。"""
+        transcript = render_transcript(chunk)
+        if len(transcript) > 60000:
+            transcript = transcript[:60000] + "\n…（更早内容已省略）"
+        if not transcript.strip():
+            return ""
+        previous_alias = self.alias
+        try:
+            reply = self._call_model(
+                [{"role": "user", "content": "请压缩以下历史对话：\n\n" + transcript}],
+                with_tools=False,
+                max_tokens=1024,
+                system_override=COMPRESS_SYSTEM_PROMPT,
+                thinking=False,
+            )
+            summary = (reply.get("text") or "").strip()
+            record = reply.get("record") or {}
+            self._compress_usage["requests"] += int(record.get("requests") or 1)
+            self._compress_usage["prompt"] += int(record.get("prompt_tokens") or 0)
+            self._compress_usage["completion"] += int(record.get("completion_tokens") or 0)
+            self._compress_usage["cached"] += int(record.get("cached_tokens") or 0)
+            if summary:
+                return summary
+        except AgentError:
+            pass
+        except Exception:
+            pass
+        finally:
+            self.alias = previous_alias
+            self.model = self._model()
+        return fallback_summary(chunk)
+
+    def _shrink_tool_outputs(self, messages: list, limit: int) -> int:
+        """把过长的工具结果就地截断，返回被截断的条数。"""
+        changed = 0
+        for message in messages:
+            if message.get("role") != "tool":
+                continue
+            content = str(message.get("content") or "")
+            if len(content) <= limit:
+                continue
+            message["content"] = content[:limit] + "\n...[上下文压缩：工具输出已截断]"
+            changed += 1
+        return changed
+
+    def _cut_index(self, keep: int) -> int:
+        """计算可安全丢弃的边界：切点之后第一条消息必须是 user。
+
+        tool 消息引用了被删掉的 assistant tool_calls 会让接口直接报错，
+        Anthropic 还要求消息以 user 开头，因此统一切在 user 边界上。
+        """
+        if len(self.messages) <= keep:
+            return 0
+        target = len(self.messages) - keep
+        for index in range(max(0, target), len(self.messages)):
+            if self.messages[index].get("role") == "user":
+                return index
+        return 0
+
+    def compress_context(self, force: bool = False) -> dict:
+        """压缩上下文，返回本次结果。
+
+        逐级递进，直到估算值低于阈值或触达 max_rounds：
+        1. 就地截断过长的工具输出（不丢对话结构，最省信息损失）；
+        2. 把更早的消息交给模型摘要后归档，只保留最近若干条；
+           摘要写入系统提示词，原始消息落盘到 context-archive/，随时可回溯。
+        """
+        settings = self._compress_settings()
+        if not settings["enabled"] and not force:
+            return {"compressed": False, "reason": "disabled"}
+
+        before = self.context_tokens()
+        threshold = settings["threshold"]
+        if before <= threshold and not force:
+            return {
+                "compressed": False,
+                "reason": "below_threshold",
+                "before": before,
+                "threshold": threshold,
+            }
+
+        rounds = 0
+        shrunk = 0
+        archived_now = 0
+        keep = settings["keep_recent"]
+
+        while rounds < settings["max_rounds"]:
+            rounds += 1
+
+            # 第 1 级：截断工具输出（不破坏对话结构，信息损失最小）
+            if rounds == 1:
+                shrunk = self._shrink_tool_outputs(self.messages, settings["shrink_chars"])
+                if shrunk and self.context_tokens() <= threshold and not force:
+                    break
+
+            # 第 2 级：摘要 + 归档早期消息
+            cut = self._cut_index(keep)
+            if cut <= 0:
+                # 保留窗口已经压到底，仍超阈值：继续收紧也无意义
+                break
+            chunk = self.messages[:cut]
+            tail = self.messages[cut:]
+            piece = self._summarize_messages(chunk)
+            if piece:
+                self.context_summary = merge_summary(self.context_summary, piece)
+            self.archive.extend(chunk)
+            archived_now += len(chunk)
+            self.messages = list(tail)
+            if self.context_tokens() <= threshold and not force:
+                break
+            # 仍然超标：下一轮把保留条数减半，直到 2 条
+            keep = max(2, keep // 2)
+
+        after = self.context_tokens()
+        result = {
+            "compressed": after < before,
+            "before": before,
+            "after": after,
+            "threshold": threshold,
+            "rounds": rounds,
+            "shrunk_tool_outputs": shrunk,
+            "archived_messages": archived_now,
+            "summary_chars": len(self.context_summary),
+        }
+        result["over_threshold"] = after > threshold
+        if result["compressed"]:
+            self._write_archive()
+            self._emit("context_compressed", **result)
+        if result["over_threshold"]:
+            self._emit(
+                "context_warning",
+                after=after,
+                threshold=threshold,
+                message="上下文压缩后仍超过阈值，已保留最近消息，建议新建会话。",
+            )
+        return result
+
+    def _write_archive(self) -> None:
+        """把归档的原始消息写入磁盘，便于回溯。"""
+        if not self.archive:
+            return
+        try:
+            path = self.usage.log_path.parent / "context-archive" / (self.usage.session_id + ".json")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "session": self.usage.session_id,
+                "summary": self.context_summary,
+                "messages": self.archive,
+            }
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
     def turn(self, text: str, thinking: bool | None = None) -> dict:
         self.messages.append({"role": "user", "content": text, "ts": now_iso()})
+        self.compress_context()
         clarify_only = is_generation_inquiry(text)
         self.turn_constraint = CLARIFY_CONSTRAINT if clarify_only else ""
         max_steps = int(self.cfg.get("max_tool_steps") or 20)
@@ -1314,13 +1582,20 @@ class Agent:
                 for call in reply["tool_calls"]:
                     arguments = call.get("arguments") or {}
                     turn_tools += 1
-                    if not self._emit("tool_call", name=call["name"], arguments=arguments, ts=step_ts):
+                    if not self._emit(
+                        "tool_call", id=call.get("id") or "", name=call["name"], arguments=arguments, ts=step_ts
+                    ):
                         print(f"\n→ {call['name']}({compact(arguments, 300)})", flush=True)
                     result = self.execute_tool(call["name"], arguments)
                     summary = compact(result, 200)
                     result_ts = now_iso()
                     if not self._emit(
-                        "tool_result", name=call["name"], summary=summary, output=result, ts=result_ts
+                        "tool_result",
+                        id=call.get("id") or "",
+                        name=call["name"],
+                        summary=summary,
+                        output=result,
+                        ts=result_ts,
                     ):
                         print(f"← {summary}", flush=True)
                     self.messages.append(
@@ -1332,6 +1607,7 @@ class Agent:
                             "ts": result_ts,
                         }
                     )
+                self.compress_context()
                 continue
 
             answer_text = reply["text"] or "模型本次没有返回可见内容，已自动重试仍未成功。请重试，或切换到其他模型。"
@@ -1376,7 +1652,9 @@ class Agent:
                 "total_tokens": totals["prompt"] + totals["completion"],
             },
             "context_tokens": self.usage.last_prompt,
+            "context_estimate": self.context_tokens(),
             "max_context": max_context,
+            "compressed": bool(self.context_summary),
         }
         if not self._emit("usage", **summary):
             context_part = (

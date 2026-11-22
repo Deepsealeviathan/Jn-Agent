@@ -8,7 +8,9 @@
 - **两种 API 协议**：Kimi 使用 Anthropic 协议（`/v1/messages`），DeepSeek 使用 OpenAI 协议（`/v1/chat/completions`）。
 - **工具调用**：`run_shell`、`read_file`、`write_file`、`list_dir`，让模型真正操作本机。
 - **文件下载**：网页顶栏「文件下载」列出 `~/.multi-model-agent/downloads` 中的文件，点击即可下载；模型可用 `publish_download` 把文件复制到该目录。
+- **实时事件流**：网页通过 SSE 逐步显示思考、工具调用与返回结果，长任务无需刷新页面；连接中断也不影响后台回合完成与保存。
 - **思考过程展示**：模型返回 `reasoning_content` 或 Anthropic `thinking` 块时，网页以可折叠面板展示完整思考过程（默认折叠，点击「展开 / 收起」切换），历史对话重新打开后也能查看。
+- **工具调用折叠**：`→ 工具名` 的调用参数与 `← 返回结果` 合并为默认折叠的块，点击标题行展开查看。
 - **可自查 Token**：模型可以调用 `get_token_usage` 工具，主动回答「你用了多少 Token」；CLI 也内置 `/usage` 和 `--stats`。
 - **Token 统计**：
   - 每次 API 响应优先读取服务端返回的 `usage`；

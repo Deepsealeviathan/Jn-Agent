@@ -565,6 +565,46 @@
   }
   .reasoning-body.hidden { display: none !important; }
 
+  .tool-box {
+    width: 100%;
+    border: 1px solid #f0f0f1; border-radius: 10px;
+    background: #fbfbfc; overflow: hidden; margin-bottom: 8px;
+  }
+  .tool-toggle {
+    width: 100%; display: flex; align-items: center; gap: 7px;
+    padding: 7px 11px; border: 0; background: transparent;
+    color: #6f7680; font-size: 12px; text-align: left; cursor: pointer;
+    user-select: none;
+  }
+  .tool-toggle:hover { background: #f5f6f7; }
+  .tool-chevron {
+    flex: none; width: 13px; height: 13px; display: inline-flex;
+    color: #b0b4ba; transition: transform .15s ease;
+  }
+  .tool-chevron svg { width: 13px; height: 13px; }
+  .tool-box.open .tool-chevron { transform: rotate(90deg); }
+  .tool-name {
+    flex: none; font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 11.5px; font-weight: 600; color: #4b5563;
+  }
+  .tool-preview {
+    flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: #9aa0a6; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px;
+  }
+  .tool-status { flex: none; margin-left: auto; font-size: 10.5px; color: #a3a8ae; }
+  .tool-status.done { color: #3f9a63; }
+  .tool-body {
+    border-top: 1px solid #f0f0f1; background: #fff;
+    padding: 9px 12px 11px;
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 11.5px; line-height: 1.58; color: #5f6368;
+    white-space: pre-wrap; word-break: break-word;
+    max-height: 42vh; overflow: auto;
+  }
+  .tool-body.hidden { display: none !important; }
+  .tool-label { color: #a3a8ae; font-size: 10.5px; margin-bottom: 3px; }
+  .tool-section + .tool-section { margin-top: 10px; padding-top: 9px; border-top: 1px dashed #f0f0f1; }
+
   .composer {
     padding: 6px 20px 12px; border-top: 0;
     background: linear-gradient(180deg, rgba(255, 255, 255, 0), #fff 24%);
@@ -959,6 +999,8 @@ const state = {
   approvalId: "",
   approvalTimer: null,
   polling: false,
+  lastToolBlock: null,
+  toolBlocks: new Map(),
 };
 
 const params = new URLSearchParams(location.search);
@@ -1007,8 +1049,14 @@ function scrollBottom() {
   box.scrollTop = box.scrollHeight;
 }
 
+function nearBottom() {
+  const box = $("messages");
+  return box.scrollHeight - box.scrollTop - box.clientHeight < 100;
+}
+
 function addMessage(role, text, before = null, ts = null) {
   removeEmpty();
+  const stick = nearBottom();
   const row = document.createElement("div");
   row.className = "msg " + role;
   const label = document.createElement("div");
@@ -1049,12 +1097,13 @@ function addMessage(role, text, before = null, ts = null) {
   }
   if (before) $("messages").insertBefore(row, before);
   else $("messages").append(row);
-  scrollBottom();
+  if (stick) scrollBottom();
   return body;
 }
 
 function addReasoning(text, before = null) {
   removeEmpty();
+  const stick = nearBottom();
   const content = String(text || "");
   const row = document.createElement("div");
   row.className = "msg reasoning";
@@ -1096,13 +1145,141 @@ function addReasoning(text, before = null) {
   row.append(box);
   if (before) $("messages").insertBefore(row, before);
   else $("messages").append(row);
-  scrollBottom();
+  if (stick) scrollBottom();
   return row;
 }
 
+function toolArgsPreview(args) {
+  if (args === null || args === undefined) return "";
+  let text;
+  try {
+    text = JSON.stringify(args);
+  } catch (_) {
+    text = String(args);
+  }
+  if (!text || text === "{}") return "";
+  return text.length > 90 ? text.slice(0, 90) + "…" : text;
+}
+
+function toolArgsText(args) {
+  if (args === null || args === undefined) return "（无参数）";
+  try {
+    const text = JSON.stringify(args, null, 2);
+    return text && text !== "{}" ? text : "（无参数）";
+  } catch (_) {
+    return String(args);
+  }
+}
+
+function addToolBlock(name, args, ts = "", before = null) {
+  removeEmpty();
+  const stick = nearBottom();
+  const row = document.createElement("div");
+  row.className = "msg tool";
+  const box = document.createElement("div");
+  box.className = "tool-box";
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "tool-toggle";
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.title = "展开查看调用详情";
+  const chevron = document.createElement("span");
+  chevron.className = "tool-chevron";
+  chevron.innerHTML = ICON_CHEVRON;
+  const nameEl = document.createElement("span");
+  nameEl.className = "tool-name";
+  nameEl.textContent = "→ " + (name || "?");
+  const preview = document.createElement("span");
+  preview.className = "tool-preview";
+  preview.textContent = toolArgsPreview(args);
+  const status = document.createElement("span");
+  status.className = "tool-status";
+  status.textContent = "执行中…";
+  toggle.append(chevron, nameEl, preview, status);
+
+  const body = document.createElement("div");
+  body.className = "tool-body hidden";
+  const callSection = document.createElement("div");
+  callSection.className = "tool-section";
+  const callLabel = document.createElement("div");
+  callLabel.className = "tool-label";
+  callLabel.textContent = "调用参数";
+  const callText = document.createElement("div");
+  callText.textContent = toolArgsText(args);
+  callSection.append(callLabel, callText);
+  body.append(callSection);
+
+  const setOpen = (open) => {
+    box.classList.toggle("open", open);
+    body.classList.toggle("hidden", !open);
+    toggle.setAttribute("aria-expanded", open ? "true" : "false");
+    toggle.title = open ? "收起调用详情" : "展开查看调用详情";
+  };
+  toggle.onclick = () => setOpen(!box.classList.contains("open"));
+  box.append(toggle, body);
+  row.append(box);
+  if (before) $("messages").insertBefore(row, before);
+  else $("messages").append(row);
+  if (stick) scrollBottom();
+
+  return {
+    row,
+    hasResult: false,
+    setResult(output, summary) {
+      if (this.hasResult) return;
+      this.hasResult = true;
+      status.textContent = "已完成";
+      status.classList.add("done");
+      const resultSection = document.createElement("div");
+      resultSection.className = "tool-section";
+      const resultLabel = document.createElement("div");
+      resultLabel.className = "tool-label";
+      resultLabel.textContent = "返回结果";
+      const resultText = document.createElement("div");
+      resultText.textContent = String(output || summary || "（无输出）");
+      resultSection.append(resultLabel, resultText);
+      body.append(resultSection);
+      if (nearBottom()) scrollBottom();
+    },
+  };
+}
+
+function addToolResultOnly(event, before = null) {
+  const block = addToolBlock(event.name || "?", null, event.ts || "", before);
+  block.setResult(event.output || event.summary, event.summary);
+  return block;
+}
+
 function renderEvent(event) {
-  if (event.type === "reasoning") addReasoning(event.text);
-  else addMessage(event.role, event.text, null, event.ts || "");
+  if (event.type === "reasoning") {
+    state.lastToolBlock = null;
+    addReasoning(event.text);
+  } else if (event.type === "tool_call") {
+    const block = addToolBlock(event.name, event.arguments, event.ts || "");
+    if (event.id) state.toolBlocks.set(event.id, block);
+    state.lastToolBlock = block;
+  } else if (event.type === "tool_result") {
+    const block = (event.id && state.toolBlocks.get(event.id)) || state.lastToolBlock;
+    if (block && !block.hasResult) {
+      block.setResult(event.output || event.summary, event.summary);
+      state.lastToolBlock = block;
+    } else {
+      state.lastToolBlock = addToolResultOnly(event);
+    }
+  } else if (event.type === "answer") {
+    state.lastToolBlock = null;
+    addMessage("assistant", event.text, null, event.ts || "");
+  } else if (event.type === "context_compressed") {
+    state.lastToolBlock = null;
+    const before = fmt(event.before || 0);
+    const after = fmt(event.after || 0);
+    addMeta(`上下文已自动压缩：${before} → ${after} token（阈值 ${fmt(event.threshold || 0)}）`);
+  } else if (event.type === "context_warning") {
+    state.lastToolBlock = null;
+    addMeta(event.message || "上下文压缩后仍超过阈值，建议新建会话。");
+  } else if (event.role) {
+    addMessage(event.role, event.text, null, event.ts || "");
+  }
 }
 
 function addMeta(text) {
@@ -1137,6 +1314,7 @@ async function restoreSession() {
     if ((data.events || []).length) {
       resetMessages();
       for (const event of data.events) renderEvent(event);
+      scrollBottom();
     }
   } catch (_) {
     state.sessionId = "";
@@ -1261,6 +1439,7 @@ async function openConversation(id) {
   }
   resetMessages();
   for (const event of data.events || []) renderEvent(event);
+  scrollBottom();
   if (isMobile()) setSidebar(false);
   loadConversations().catch(() => {});
   $("input").focus();
@@ -1410,6 +1589,86 @@ async function loadModels() {
   $("status").textContent = `${data.models.filter((item) => item.available).length} 个模型可用`;
 }
 
+async function streamChat(payload, onEvent) {
+  const response = await fetch("/api/chat", {
+    method: "POST",
+    headers: { ...authHeaders(), "Accept": "text/event-stream" },
+    body: JSON.stringify(payload),
+  });
+  if (response.status === 401) {
+    $("auth").classList.remove("hidden");
+    throw new Error("需要访问令牌");
+  }
+  const contentType = response.headers.get("Content-Type") || "";
+  if (!contentType.includes("text/event-stream")) {
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || ("HTTP " + response.status));
+    return data;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalPayload = null;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let boundary;
+    while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      for (const line of frame.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        let event;
+        try {
+          event = JSON.parse(line.slice(5).trim());
+        } catch (_) {
+          continue;
+        }
+        if (event.type === "done") {
+          finalPayload = event.payload || {};
+        } else if (event.type === "error") {
+          throw new Error(event.error || "模型调用失败");
+        } else {
+          onEvent(event);
+        }
+      }
+    }
+  }
+  if (!finalPayload) throw new Error("连接中断，未收到完整回复");
+  return finalPayload;
+}
+
+function handleStreamEvent(event, pending) {
+  if (pending && !pending.isConnected) return;
+  const before = pending && pending.parentElement ? pending.parentElement : null;
+  if (event.type === "reasoning") {
+    state.lastToolBlock = null;
+    addReasoning(event.text, before);
+  } else if (event.type === "tool_call") {
+    const block = addToolBlock(event.name, event.arguments, event.ts || "", before);
+    if (event.id) state.toolBlocks.set(event.id, block);
+    state.lastToolBlock = block;
+  } else if (event.type === "tool_result") {
+    const block = (event.id && state.toolBlocks.get(event.id)) || state.lastToolBlock;
+    if (block && !block.hasResult) {
+      block.setResult(event.output || event.summary, event.summary);
+      state.lastToolBlock = block;
+    } else {
+      state.lastToolBlock = addToolResultOnly(event, before);
+    }
+  } else if (event.type === "answer") {
+    state.lastToolBlock = null;
+    if (pending) pending.textContent = event.text || "（空回复）";
+    if (nearBottom()) scrollBottom();
+  } else if (event.type === "usage") {
+    if (event.session) {
+      state.sessionUsage = event.session;
+      updateSessionChip();
+    }
+  }
+}
+
 async function send() {
   const input = $("input");
   const text = input.value.trim();
@@ -1419,10 +1678,13 @@ async function send() {
   $("send").disabled = true;
   input.value = "";
   input.style.height = "";
+  state.lastToolBlock = null;
+  state.toolBlocks.clear();
   const turnId = newTurnId();
   startApprovalPolling(turnId);
   addMessage("user", text);
   const pending = addMessage("assistant", "思考中…");
+  let streamed = false;
 
   try {
     const payload = {
@@ -1433,42 +1695,52 @@ async function send() {
       turn_id: turnId,
     };
     if (state.thinkingSupported) payload.thinking = state.thinking;
-    const data = await api("/api/chat", {
-      method: "POST",
-      body: JSON.stringify(payload),
+    const data = await streamChat(payload, (event) => {
+      streamed = true;
+      handleStreamEvent(event, pending);
     });
-    state.sessionId = data.session_id;
-    localStorage.setItem("agent_session", state.sessionId);
-    if (data.model) {
-      state.model = data.model;
-      localStorage.setItem("agent_model", data.model);
-      $("model").value = data.model;
-      applyModelCapabilities();
-    }
-    for (const event of data.tools || []) {
-      if (event.type === "reasoning") {
-        addReasoning(event.text, pending.parentElement);
-      } else if (event.type === "tool_call") {
-        addMessage("tool", "→ " + event.name + " " + JSON.stringify(event.arguments), pending.parentElement, event.ts || "");
-      } else if (event.type === "tool_result") {
-        addMessage("tool", "← " + event.summary, pending.parentElement, event.ts || "");
+    if (pending.isConnected) {
+      state.sessionId = data.session_id;
+      localStorage.setItem("agent_session", state.sessionId);
+      if (data.model) {
+        state.model = data.model;
+        localStorage.setItem("agent_model", data.model);
+        $("model").value = data.model;
+        applyModelCapabilities();
       }
+      if (!streamed) {
+        for (const event of data.tools || []) {
+          if (event.type === "reasoning") {
+            addReasoning(event.text, pending.parentElement);
+          } else if (event.type === "tool_call") {
+            const block = addToolBlock(event.name, event.arguments, event.ts || "", pending.parentElement);
+            if (event.id) state.toolBlocks.set(event.id, block);
+            state.lastToolBlock = block;
+          } else if (event.type === "tool_result") {
+            const block = (event.id && state.toolBlocks.get(event.id)) || state.lastToolBlock;
+            if (block && !block.hasResult) block.setResult(event.output || event.summary, event.summary);
+            else addToolResultOnly(event, pending.parentElement);
+          }
+        }
+      }
+      pending.textContent = data.answer || "（空回复）";
+      if (data.conversation && data.conversation.usage) {
+        state.sessionUsage = data.conversation.usage;
+      } else {
+        state.sessionUsage = data.usage.session;
+      }
+      updateSessionChip();
+      showUsageMeta(data.usage, state.sessionUsage);
+      if (nearBottom()) scrollBottom();
     }
-    pending.textContent = data.answer || "（空回复）";
-    if (data.conversation && data.conversation.usage) {
-      state.sessionUsage = data.conversation.usage;
-    } else {
-      state.sessionUsage = data.usage.session;
-    }
-    updateSessionChip();
-    showUsageMeta(data.usage, state.sessionUsage);
-    scrollBottom();
     if (!$("stats").classList.contains("hidden")) loadStats(state.statsRange).catch(() => {});
     if (!$("downloads").classList.contains("hidden")) loadDownloads();
     loadConversations().catch(() => {});
   } catch (error) {
-    pending.parentElement.className = "msg error";
-    pending.textContent = "错误：" + error.message;
+    if (pending.isConnected) {
+      pending.parentElement.className = "msg error";
+      pending.textContent = "错误：" + error.message;
+    }
   } finally {
     stopApprovalPolling();
     state.busy = false;
@@ -1478,6 +1750,8 @@ async function send() {
 }
 
 function resetMessages() {
+  state.lastToolBlock = null;
+  state.toolBlocks.clear();
   $("messages").innerHTML =
     '<div class="empty" id="empty">' +
     '<div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M18.4 5.6l-2.8 2.8M8.4 15.6l-2.8 2.8"/></svg></div>' +

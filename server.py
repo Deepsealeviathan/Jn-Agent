@@ -199,17 +199,37 @@ def conversation_events(messages: list) -> list:
             for call in message.get("tool_calls") or []:
                 event = {
                     "role": "tool",
-                    "text": f"→ {call.get('name') or '?'} {core.compact(call.get('arguments') or {}, 300)}",
+                    "type": "tool_call",
+                    "id": call.get("id") or "",
+                    "name": call.get("name") or "?",
+                    "arguments": call.get("arguments") or {},
                 }
                 if ts:
                     event["ts"] = ts
                 events.append(event)
         elif role == "tool":
-            event = {"role": "tool", "text": "← " + core.compact(message.get("content") or "", 300)}
+            content = str(message.get("content") or "")
+            event = {
+                "role": "tool",
+                "type": "tool_result",
+                "id": message.get("tool_call_id") or "",
+                "name": message.get("name") or "?",
+                "summary": core.compact(content, 200),
+                "output": content[:4000] + ("\n...[历史记录已截断]" if len(content) > 4000 else ""),
+            }
             if ts:
                 event["ts"] = ts
             events.append(event)
     return events
+
+
+def display_event(event: dict) -> dict:
+    """Trim oversized tool output before it goes over the wire."""
+    item = dict(event)
+    output = item.get("output")
+    if isinstance(output, str) and len(output) > 4000:
+        item["output"] = output[:4000] + "\n...[已截断]"
+    return item
 
 
 class ConversationStore:
@@ -581,6 +601,24 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, status: int, data: dict):
         self._send(status, json.dumps(data, ensure_ascii=False).encode("utf-8"))
 
+    def _stream_start(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.close_connection = True
+
+    def _stream_send(self, event: dict) -> bool:
+        payload = json.dumps(event, ensure_ascii=False).encode("utf-8")
+        try:
+            self.wfile.write(b"data: " + payload + b"\n\n")
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return False
+
     def _authorized(self) -> bool:
         token = self.server.token
         header = self.headers.get("Authorization") or ""
@@ -816,7 +854,19 @@ class Handler(BaseHTTPRequestHandler):
         if not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", turn_id):
             turn_id = uuid.uuid4().hex[:16]
 
+        wants_stream = "text/event-stream" in (self.headers.get("Accept") or "").lower()
         events: list[dict] = []
+        stream_state = {"open": wants_stream}
+        if wants_stream:
+            self._stream_start()
+
+        def sink(event: dict) -> None:
+            if wants_stream:
+                if stream_state["open"]:
+                    stream_state["open"] = self._stream_send(display_event(event))
+            else:
+                events.append(display_event(event))
+
         with entry.lock:
             if requested_model:
                 entry.agent.alias = requested_model
@@ -826,15 +876,25 @@ class Handler(BaseHTTPRequestHandler):
             entry.agent.approval_handler = lambda name, arguments: self.server.approvals.request(
                 turn_id, name, arguments
             )
-            entry.agent.event_sink = events.append
+            entry.agent.event_sink = sink
             try:
                 result = entry.agent.turn(message.strip(), thinking=thinking)
             except core.AgentError as exc:
-                self._json(502, {"error": str(exc), "session_id": session_id})
+                if wants_stream:
+                    if stream_state["open"]:
+                        self._stream_send({"type": "error", "error": str(exc), "session_id": session_id})
+                else:
+                    self._json(502, {"error": str(exc), "session_id": session_id})
                 return
             except Exception as exc:
                 traceback.print_exc()
-                self._json(500, {"error": f"内部错误：{exc}", "session_id": session_id})
+                if wants_stream:
+                    if stream_state["open"]:
+                        self._stream_send(
+                            {"type": "error", "error": f"内部错误：{exc}", "session_id": session_id}
+                        )
+                else:
+                    self._json(500, {"error": f"内部错误：{exc}", "session_id": session_id})
                 return
             finally:
                 entry.agent.event_sink = None
@@ -845,29 +905,28 @@ class Handler(BaseHTTPRequestHandler):
                 traceback.print_exc()
                 record = entry.record
 
-        for event in events:
-            if "output" in event and len(event["output"]) > 4000:
-                event["output"] = event["output"][:4000] + "\n...[已截断]"
-        self._json(
-            200,
-            {
-                "session_id": session_id,
-                "model": result["model"],
-                "answer": result["answer"],
-                "tools": events,
-                "usage": {
-                    "turn": result["turn"],
-                    "session": result["session"],
-                    "context_tokens": result["context_tokens"],
-                    "max_context": result["max_context"],
-                },
-                "conversation": {
-                    "id": session_id,
-                    "title": record.get("title"),
-                    "usage": conversation_usage(record),
-                },
+        payload = {
+            "session_id": session_id,
+            "model": result["model"],
+            "answer": result["answer"],
+            "tools": [] if wants_stream else events,  # already trimmed by sink
+            "usage": {
+                "turn": result["turn"],
+                "session": result["session"],
+                "context_tokens": result["context_tokens"],
+                "max_context": result["max_context"],
             },
-        )
+            "conversation": {
+                "id": session_id,
+                "title": record.get("title"),
+                "usage": conversation_usage(record),
+            },
+        }
+        if wants_stream:
+            if stream_state["open"]:
+                self._stream_send({"type": "done", "payload": payload})
+        else:
+            self._json(200, payload)
 
 
 def build_models_payload(cfg: dict) -> dict:
