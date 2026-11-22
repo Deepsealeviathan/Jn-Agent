@@ -945,7 +945,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"本机访问：http://localhost:{args.port}/?token={token}", flush=True)
     print(f"局域网访问：请使用本机地址的 {args.port} 端口（不在此处显示具体 IP）", flush=True)
     if not args.auto:
-        print("提示：未启用 --auto，shell/写文件操作会被拒绝。", flush=True)
+        print("提示：Web 端是否确认由页面「操作权限」决定；--auto 主要影响命令行模式。", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

@@ -815,7 +815,7 @@
       </div>
     </div>
     <div class="composer-foot">
-      <span class="policy-hint" id="policyHint">仅删除文件时确认</span>
+      <span class="policy-hint" id="policyHint">删除、安装软件等敏感操作需确认</span>
       <span class="composer-note">内容由 AI 生成，请谨慎判断</span>
     </div>
   </footer>
@@ -1291,7 +1291,7 @@ function applyModelCapabilities() {
 function updatePolicyHint() {
   const hints = {
     always: "所有文件读取、写入和命令执行都需要确认",
-    necessary: "仅删除文件时需要确认",
+    necessary: "删除文件、安装软件、sudo 等敏感操作需要确认",
     auto: "不询问，直接执行所有操作",
   };
   $("policyHint").textContent = hints[state.approvalMode] || hints.necessary;

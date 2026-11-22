@@ -141,7 +141,7 @@ taskkill.exe /F /PID $(cat ~/.multi-model-agent/win_proxy.pid)
 - `publish_download`：把一个本机文件复制到 `~/.multi-model-agent/downloads`，供网页下载；同名文件会被覆盖。
 - `get_token_usage`：返回本次会话与历史累计的 Token 明细，无需确认。
 
-`run_shell` 与 `write_file` 默认需要确认；非交互模式（直接传 prompt）下默认拒绝，除非加 `--auto`。
+`run_shell` 与 `write_file` 默认需要确认；非交互模式（直接传 prompt）下默认拒绝，除非加 `--auto`。WebUI 的「必要时询问」还会拦截 `pip install`、`npm install`、`apt install` 等软件安装以及所有 `sudo` 命令，弹窗等待用户允许或拒绝。
 
 ## 扩展新模型
 

@@ -119,9 +119,17 @@ TOOL_DEFS = [
 APPROVAL_TOOLS = {"run_shell", "write_file"}
 FILE_TOOLS = {"run_shell", "write_file", "read_file", "list_dir", "publish_download"}
 DESTRUCTIVE_RE = re.compile(
-    r"(^|[;&|()\s])(rm|rmdir|unlink|shred)\s|find\b[^\n]*\s-delete\b|truncate\b",
+    r"(^|[;&|()\s/])(rm|rmdir|unlink|shred)\s|find\b[^\n]*\s-delete\b|truncate\b",
     re.IGNORECASE,
 )
+PACKAGE_INSTALL_RE = re.compile(
+    r"(^|[;&|()\s/])(sudo\s+)?"
+    r"(pip3?|pipx|python3?(?:\.\d+)?\s+-m\s+pip|uv(?:\s+pip)?|poetry|npm|pnpm|yarn|"
+    r"apt|apt-get|yum|dnf|apk|conda|brew|cargo|gem|composer)"
+    r"\s+(install|add|upgrade|update|uninstall|remove)\b",
+    re.IGNORECASE,
+)
+SUDO_RE = re.compile(r"(^|[;&|()\s/])sudo\s", re.IGNORECASE)
 
 LONG_CONTENT_RE = re.compile(
     r"(小说|故事|文章|文案|剧本|诗歌|诗|作文|论文|报告|方案|计划|邮件|演讲稿|歌词|段子|长文|代码|程序)"
@@ -1051,7 +1059,11 @@ class Agent:
             if name != "run_shell":
                 return False
             command = str(arguments.get("command") or "")
-            return bool(DESTRUCTIVE_RE.search(command))
+            return bool(
+                DESTRUCTIVE_RE.search(command)
+                or PACKAGE_INSTALL_RE.search(command)
+                or SUDO_RE.search(command)
+            )
         if mode == "standard":
             return name in APPROVAL_TOOLS
         return name in FILE_TOOLS
