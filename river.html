@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>奔流的河水 · 3D</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#05080d;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;}
+  #app{position:fixed;inset:0;}
+  canvas{display:block;}
+  .hud{position:fixed;left:24px;bottom:22px;color:#a9c6d8;font-size:12px;letter-spacing:.18em;
+       text-shadow:0 0 12px rgba(80,180,255,.5);pointer-events:none;opacity:.75;}
+  .title{position:fixed;left:24px;top:22px;color:#cfe8f7;font-size:20px;letter-spacing:.4em;
+         text-shadow:0 0 22px rgba(90,200,255,.65);pointer-events:none;opacity:.85;}
+  .title small{display:block;font-size:10px;letter-spacing:.32em;color:#6d93a8;margin-top:6px;}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div class="title">奔 流 的 河 水<small>FLOWING RIVER · WEBGL</small></div>
+<div class="hud">鼠标拖动旋转 · 滚轮缩放</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { Water } from 'three/addons/objects/Water.js';
+import { Sky } from 'three/addons/objects/Sky.js';
+
+/* ---------- 基础场景 ---------- */
+const app = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.62;
+app.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x0a1a26, 0.0075);
+
+const camera = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 0.1, 8000);
+camera.position.set(0, 62, 168);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 4, 0);
+controls.maxPolarAngle = Math.PI * 0.495;
+controls.minDistance = 40;
+controls.maxDistance = 420;
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.autoRotate = true;
+controls.autoRotateSpeed = 0.18;
+
+/* ---------- 天空与光照 ---------- */
+const sky = new Sky();
+sky.scale.setScalar(10000);
+scene.add(sky);
+
+const sun = new THREE.Vector3();
+const skyU = sky.material.uniforms;
+skyU.turbidity.value = 6.5;
+skyU.rayleigh.value = 2.4;
+skyU.mieCoefficient.value = 0.006;
+skyU.mieDirectionalG.value = 0.82;
+
+// 黄昏偏冷的光照
+const elevation = 8;
+const azimuth = 205;
+const phi = THREE.MathUtils.degToRad(90 - elevation);
+const theta = THREE.MathUtils.degToRad(azimuth);
+sun.setFromSphericalCoords(1, phi, theta);
+skyU.sunPosition.value.copy(sun);
+
+const dirLight = new THREE.DirectionalLight(0xffd9b0, 2.0);
+dirLight.position.copy(sun).multiplyScalar(400);
+scene.add(dirLight);
+scene.add(new THREE.HemisphereLight(0x9fd8ff, 0x1a2a2a, 0.75));
+scene.add(new THREE.AmbientLight(0x486a80, 0.5));
+
+/* ---------- 河床 / 地形（两岸） ---------- */
+const terrainMat = new THREE.MeshStandardMaterial({
+  color: 0x2b3a33, roughness: 1.0, metalness: 0.0, flatShading: true
+});
+
+function makeBank(side) {
+  const segX = 190, segZ = 120;
+  const W = 1200, D = 900;
+  const geo = new THREE.PlaneGeometry(W, D, segX, segZ);
+  const pos = geo.attributes.position;
+  const v = new THREE.Vector3();
+
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i);
+    const x = v.x;
+    const z = v.y;            // 平面局部 y -> 世界 z
+
+    // 河道中心约为 0，河宽约 +/- 34
+    const distCenter = Math.abs(x);
+    const bankEdge = 34;
+
+    // 从岸边向外抬升
+    const rise = THREE.MathUtils.smoothstep(distCenter, bankEdge, bankEdge + 210);
+    let h = Math.pow(rise, 1.6) * 60;
+
+    // 起伏山脉噪声
+    const n1 = Math.sin(x * 0.013 + side * 3.1) * Math.cos(z * 0.011) * 9;
+    const n2 = Math.sin(x * 0.041 - z * 0.026) * 3.4;
+    const n3 = Math.sin(x * 0.006 + z * 0.004) * 16;
+    h += (n1 + n2 + n3) * rise * 1.25;
+
+    // 岸边轻微下切，形成河道剖面
+    if (distCenter < bankEdge + 40) {
+      h -= (1 - THREE.MathUtils.smoothstep(distCenter, bankEdge - 30, bankEdge + 40)) * 3.2;
+    }
+    h -= 2.0; // 让岸线略低于水面
+
+    pos.setZ(i, h);
+  }
+  geo.computeVertexNormals();
+
+  // 顶点着色：低处偏绿，高处偏冷灰
+  const colors = [];
+  const p = geo.attributes.position;
+  const cLow = new THREE.Color(0x33452f);
+  const cMid = new THREE.Color(0x3d4a4b);
+  const cHigh = new THREE.Color(0x5d6d78);
+  const c = new THREE.Color();
+  for (let i = 0; i < p.count; i++) {
+    const y = p.getZ(i);
+    if (y < 8) c.copy(cLow).lerp(cMid, THREE.MathUtils.clamp(y / 8, 0, 1));
+    else c.copy(cMid).lerp(cHigh, THREE.MathUtils.clamp((y - 8) / 42, 0, 1));
+    const v2 = 0.94 + Math.random() * 0.12;
+    colors.push(c.r * v2, c.g * v2, c.b * v2);
+  }
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+  const mat = terrainMat.clone();
+  mat.vertexColors = true;
+
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.rotation.x = -Math.PI / 2;
+  mesh.position.set(side > 0 ? 640 : -640, 0, 0);
+  return mesh;
+}
+scene.add(makeBank(1), makeBank(-1));
+
+/* ---------- 水面（Water 着色器） ---------- */
+const waterGeo = new THREE.PlaneGeometry(3000, 4200, 32, 32);
+
+waterGeo.rotateX(-Math.PI / 2);
+
+// 生成程序化法线贴图
+function makeNormalTexture(size = 512) {
+  const data = new Uint8Array(size * size * 4);
+  const waves = [
+    { fx: 3.1, fz: 1.7, a: 1.0, ph: 0.0 },
+    { fx: 7.3, fz: -5.1, a: 0.55, ph: 1.7 },
+    { fx: -12.7, fz: 9.3, a: 0.3, ph: 3.1 },
+    { fx: 21.5, fz: 14.1, a: 0.16, ph: 0.9 },
+    { fx: 33.0, fz: -27.0, a: 0.09, ph: 2.4 },
+  ];
+  const h = (x, y) => {
+    let s = 0;
+    for (const w of waves) {
+      const p = (x / size) * Math.PI * 2, q = (y / size) * Math.PI * 2;
+      s += w.a * Math.sin(w.fx * p + w.fz * q + w.ph);
+    }
+    return s;
+  };
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const e = 1.0;
+      const dx = (h(x + e, y) - h(x - e, y)) * 0.5;
+      const dy = (h(x, y + e) - h(x, y - e)) * 0.5;
+      let nx = -dx * 0.9, ny = -dy * 0.9, nz = 1.0;
+      const len = Math.hypot(nx, ny, nz);
+      nx /= len; ny /= len; nz /= len;
+      const i = (y * size + x) * 4;
+      data[i] = (nx * 0.5 + 0.5) * 255;
+      data[i + 1] = (ny * 0.5 + 0.5) * 255;
+      data[i + 2] = (nz * 0.5 + 0.5) * 255;
+      data[i + 3] = 255;
+    }
+  }
+  const tex = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+const normalMap = makeNormalTexture(512);
+normalMap.repeat.set(60, 80);
+
+const water = new Water(waterGeo, {
+  textureWidth: 512,
+  textureHeight: 512,
+  waterNormals: normalMap,
+  sunDirection: new THREE.Vector3().copy(sun).normalize(),
+  sunColor: 0xffeedd,
+  waterColor: 0x0b2a3a,
+  distortionScale: 3.4,
+  fog: true,
+  alpha: 1.0,
+});
+water.rotation.x = 0;
+water.position.y = 0;
+scene.add(water);
+
+// 水流方向动画：偏移法线贴图 UV
+const waterU = water.material.uniforms;
+waterU.size.value = 2.6;
+
+/* ---------- 泡沫 / 漂流物粒子 ---------- */
+const COUNT = 2600;
+const pGeo = new THREE.BufferGeometry();
+const pPos = new Float32Array(COUNT * 3);
+const pSpeed = new Float32Array(COUNT);
+const pPhase = new Float32Array(COUNT);
+const pScale = new Float32Array(COUNT);
+
+const STREAM_LEN = 1400;   // 流向长度
+const STREAM_HALF = 30;    // 半河宽
+
+for (let i = 0; i < COUNT; i++) {
+  pPos[i * 3] = (Math.random() * 2 - 1) * STREAM_HALF;
+  pPos[i * 3 + 1] = 0.35 + Math.random() * 0.5;
+  pPos[i * 3 + 2] = (Math.random() - 0.5) * STREAM_LEN;
+  // 中间流速快（模拟河心急流）
+  const mid = 1 - Math.abs(pPos[i * 3]) / STREAM_HALF;
+  pSpeed[i] = 22 + mid * 46 + Math.random() * 8;
+  pPhase[i] = Math.random() * Math.PI * 2;
+  pScale[i] = 0.6 + Math.random() * 1.9;
+}
+pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+pGeo.setAttribute('aScale', new THREE.BufferAttribute(pScale, 1));
+
+function makeFoamTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const g = c.getContext('2d');
+  const grd = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+  grd.addColorStop(0, 'rgba(255,255,255,1)');
+  grd.addColorStop(0.35, 'rgba(225,245,255,0.55)');
+  grd.addColorStop(1, 'rgba(200,235,255,0)');
+  g.fillStyle = grd;
+  g.beginPath();
+  g.ellipse(64, 64, 62, 30, 0, 0, Math.PI * 2);
+  g.fill();
+  return new THREE.CanvasTexture(c);
+}
+
+const foamMat = new THREE.PointsMaterial({
+  size: 2.6,
+  map: makeFoamTexture(),
+  transparent: true,
+  opacity: 0.55,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending,
+  color: 0xd8f2ff,
+  sizeAttenuation: true,
+  fog: true,
+});
+const foam = new THREE.Points(pGeo, foamMat);
+scene.add(foam);
+
+/* ---------- 雨丝 / 水雾 ---------- */
+const MIST = 1400;
+const mGeo = new THREE.BufferGeometry();
+const mPos = new Float32Array(MIST * 3);
+for (let i = 0; i < MIST; i++) {
+  mPos[i * 3] = (Math.random() * 2 - 1) * 260;
+  mPos[i * 3 + 1] = Math.random() * 90;
+  mPos[i * 3 + 2] = (Math.random() - 0.5) * 600;
+}
+mGeo.setAttribute('position', new THREE.BufferAttribute(mPos, 3));
+const mist = new THREE.Points(mGeo, new THREE.PointsMaterial({
+  size: 1.1, color: 0x93bcd6, transparent: true, opacity: 0.22,
+  depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true
+}));
+scene.add(mist);
+
+/* ---------- 动画循环 ---------- */
+const clock = new THREE.Clock();
+let t = 0;
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  t += dt;
+
+  // 水面波动
+  waterU.time.value = t * 1.35;
+
+  // 法线贴图滚动，制造"奔流"方向感
+  normalMap.offset.x += dt * 0.055;
+  normalMap.offset.y -= dt * 0.13;
+
+  // 粒子随流推进
+  const arr = pGeo.attributes.position.array;
+  for (let i = 0; i < COUNT; i++) {
+    const iz = i * 3 + 2;
+    arr[iz] += pSpeed[i] * dt;
+    // 横向漂移 + 正弦摆动
+    arr[i * 3] += Math.sin(t * 1.6 + pPhase[i]) * dt * 2.2;
+    arr[i * 3 + 1] = 0.35 + Math.sin(t * 2.4 + pPhase[i]) * 0.22;
+
+    if (arr[iz] > STREAM_LEN / 2) {
+      arr[iz] -= STREAM_LEN;
+      arr[i * 3] = (Math.random() * 2 - 1) * STREAM_HALF;
+    }
+    // 横向边界回收
+    if (Math.abs(arr[i * 3]) > STREAM_HALF) {
+      arr[i * 3] = Math.sign(arr[i * 3]) * STREAM_HALF;
+    }
+  }
+  pGeo.attributes.position.needsUpdate = true;
+
+  // 水雾缓慢飘动
+  const ma = mGeo.attributes.position.array;
+  for (let i = 0; i < MIST; i++) {
+    ma[i * 3 + 2] += dt * (16 + (i % 7) * 3);
+    ma[i * 3] += Math.sin(t * 0.7 + i) * dt * 3;
+    if (ma[i * 3 + 2] > 300) ma[i * 3 + 2] -= 600;
+    if (ma[i * 3 + 1] > 90) ma[i * 3 + 1] -= 90;
+  }
+  mGeo.attributes.position.needsUpdate = true;
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+/* ---------- 自适应 ---------- */
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>

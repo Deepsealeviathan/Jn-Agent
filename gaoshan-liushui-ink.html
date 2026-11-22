@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>高山流水 · 水墨</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#efe9dc;
+    font-family:"Songti SC","STSong","SimSun",serif;}
+  #app{position:fixed;inset:0;}
+  canvas{display:block;}
+  .seal{position:fixed;right:52px;top:46px;width:44px;height:44px;border:2px solid #9c3327;
+    border-radius:3px;color:#9c3327;display:flex;align-items:center;justify-content:center;
+    font-size:15px;line-height:1;letter-spacing:1px;writing-mode:vertical-rl;
+    opacity:.86;pointer-events:none;font-family:"Songti SC",serif;}
+  .title{position:fixed;right:56px;top:104px;writing-mode:vertical-rl;color:#2c2a26;
+    font-size:26px;letter-spacing:.42em;opacity:.82;pointer-events:none;
+    text-shadow:0 0 24px rgba(255,255,255,.8);}
+  .title small{font-size:11px;letter-spacing:.34em;color:#6a655c;opacity:.9;}
+  .hint{position:fixed;left:40px;bottom:34px;color:#6a655c;font-size:12px;
+    letter-spacing:.26em;opacity:.62;pointer-events:none;font-family:-apple-system,sans-serif;}
+  .edge{position:fixed;inset:0;pointer-events:none;
+    background:radial-gradient(ellipse at 50% 48%,rgba(0,0,0,0) 52%,rgba(120,108,88,.22) 100%);}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div class="edge"></div>
+<div class="seal">山水</div>
+<div class="title">高山流水<small>　知音</small></div>
+<div class="hint">移动鼠标 · 云气流动</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* ============ 渲染器 ============ */
+const app = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.NoToneMapping;
+app.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xefe9dc);
+
+const camera = new THREE.PerspectiveCamera(46, window.innerWidth / window.innerHeight, 1, 12000);
+camera.position.set(0, 0, 1000);
+
+/* ============ GLSL 公共噪声 ============ */
+const NOISE = `
+float h21(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
+float vnoise(vec2 p){
+  vec2 i = floor(p); vec2 f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = h21(i), b = h21(i + vec2(1.0, 0.0));
+  float c = h21(i + vec2(0.0, 1.0)), d = h21(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+float fbm(vec2 p){
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 5; i++){ v += a * vnoise(p); p = p * 2.03 + 7.3; a *= 0.5; }
+  return v;
+}
+float ridged(vec2 p){
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 5; i++){
+    v += a * (1.0 - abs(vnoise(p) * 2.0 - 1.0));
+    p = p * 2.07 + 3.1; a *= 0.5;
+  }
+  return v;
+}
+`;
+
+/* ============ 山峦层着色器 ============ */
+const mountainVert = `
+varying vec2 vUv;
+void main(){
+  vUv = uv;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+const mountainFrag = `
+precision highp float;
+varying vec2 vUv;
+
+uniform float uTime;
+uniform float uSeed;
+uniform float uBase;      // 山体基础高度
+uniform float uRelief;    // 起伏强度
+uniform float uPeak;      // 主峰权重
+uniform float uPeakX;     // 主峰横向位置
+uniform float uInk;       // 墨色深浅
+uniform float uMistH;     // 底部云气渐隐高度
+uniform float uMistY;     // 云带高度
+uniform float uDetail;    // 皴法纹理强度
+uniform vec3  uInkCol;
+uniform vec3  uPaperCol;
+
+${NOISE}
+
+void main(){
+  float x = vUv.x;
+  float y = vUv.y;
+
+  // ---- 山脊轮廓 ----
+  float broad = fbm(vec2(x * 1.9 + uSeed * 4.7, uSeed * 2.3));
+  float peaks = pow(ridged(vec2(x * 3.4 + uSeed * 1.9, uSeed * 5.1)), 1.45);
+  float ridge = uBase + broad * 0.16 + peaks * uRelief;
+
+  // 主峰：高斯隆起
+  float g = exp(-pow((x - uPeakX) * 4.2, 2.0));
+  ridge += uPeak * g * (0.78 + 0.32 * fbm(vec2(x * 7.0 + uSeed, uSeed)));
+
+  // 细碎山石
+  ridge += (fbm(vec2(x * 16.0 + uSeed * 3.0, uSeed * 7.0)) - 0.5) * 0.028;
+
+  // 缓动，使山顶圆润
+  ridge += 0.035 * sin(x * 21.0 + uSeed * 9.0);
+
+  // ---- 山体遮罩（墨边晕染） ----
+  float d = ridge - y;
+  float alpha = smoothstep(-0.014, 0.006, d);
+
+  // ---- 皴法纹理 ----
+  float streak = fbm(vec2(x * 110.0 + uSeed * 31.0, y * 7.0 + uSeed * 13.0));
+  float blot  = fbm(vec2(x * 26.0 + uSeed * 7.0, y * 22.0 - uSeed * 5.0));
+  float tex = mix(1.0, 0.62 + 0.7 * streak, uDetail);
+  tex *= 0.88 + 0.24 * blot;
+
+  // 越靠山脚越浓（远山淡、近山浓由外层控制）
+  float depthTone = mix(1.16, 0.80, smoothstep(0.0, 0.85, d / max(ridge, 0.001)));
+
+  // 山脊处留白、内部实墨
+  float edgeLight = smoothstep(-0.10, 0.02, d);
+
+  vec3 col = uInkCol * (uInk * tex * depthTone);
+  col = mix(uPaperCol, col, clamp(edgeLight * 0.98 + 0.02, 0.0, 1.0));
+
+  // ---- 云气（横向雾带 + 底部升腾） ----
+  float bandY = uMistY + 0.045 * sin(x * 5.2 + uTime * 0.22)
+                       + 0.026 * sin(x * 11.5 - uTime * 0.16);
+  float band = smoothstep(0.085, 0.0, abs(y - bandY));
+  float breathe = 0.55 + 0.45 * fbm(vec2(x * 3.2 + uTime * 0.10, uTime * 0.07));
+
+  float foot = smoothstep(uMistH, 0.0, y);         // 山脚化入云烟
+  float cloud = clamp(band * breathe * 0.95 + foot * 0.92, 0.0, 1.0);
+
+  col = mix(col, uPaperCol, cloud);
+  alpha *= mix(1.0, 0.10, foot);
+  alpha *= mix(1.0, 0.48, band * breathe);
+
+  if (alpha < 0.004) discard;
+  gl_FragColor = vec4(col, alpha);
+}
+`;
+
+function makeMountain(opts) {
+  const geo = new THREE.PlaneGeometry(opts.w, opts.h, 1, 1);
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime:    { value: 0 },
+      uSeed:    { value: opts.seed },
+      uBase:    { value: opts.base },
+      uRelief:  { value: opts.relief },
+      uPeak:    { value: opts.peak },
+      uPeakX:   { value: opts.peakX ?? 0.5 },
+      uInk:     { value: opts.ink },
+      uMistH:   { value: opts.mistH },
+      uMistY:   { value: opts.mistY },
+      uDetail:  { value: opts.detail ?? 0.55 },
+      uInkCol:  { value: new THREE.Color(opts.inkCol) },
+      uPaperCol:{ value: new THREE.Color(0xefe9dc) }
+    },
+    vertexShader: mountainVert,
+    fragmentShader: mountainFrag,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(opts.x ?? 0, opts.y ?? 0, opts.z);
+  mesh.renderOrder = opts.order;
+  return mesh;
+}
+
+/* 由远及近的五重山峦 */
+const layers = [
+  { z: -2600, w: 7200, h: 2000, y: 190,  seed: 3.1, base: 0.34, relief: 0.30, peak: 0.10,
+    ink: 0.30, inkCol: 0x8c93a6, mistH: 0.34, mistY: 0.46, detail: 0.22, order: 0 },
+  { z: -1900, w: 5800, h: 1750, y: 120,  seed: 7.7, base: 0.32, relief: 0.36, peak: 0.14,
+    ink: 0.46, inkCol: 0x6f7684, mistH: 0.36, mistY: 0.44, detail: 0.34, order: 1 },
+  { z: -1250, w: 4600, h: 1600, y: 30,   seed: 12.3, base: 0.30, relief: 0.40, peak: 0.22,
+    ink: 0.62, inkCol: 0x55585e, mistH: 0.30, mistY: 0.38, detail: 0.48, order: 2 },
+  // 主峰：承载瀑布
+  { z: -700,  w: 3400, h: 1750, y: -80,  seed: 18.9, base: 0.26, relief: 0.30, peak: 0.36,
+    peakX: 0.50, ink: 0.80, inkCol: 0x3a3a36, mistH: 0.18, mistY: 0.30, detail: 0.62, order: 3 },
+  { z: -240,  w: 2400, h: 1500, y: -260, seed: 25.4, base: 0.14, relief: 0.20, peak: 0.05,
+    ink: 0.42, inkCol: 0x4a4a44, mistH: 0.40, mistY: 0.52, detail: 0.40, order: 4 }
+];
+const mountainMeshes = layers.map(makeMountain);
+mountainMeshes.forEach(m => scene.add(m));
+
+/* ============ 瀑布 ============ */
+const fallFrag = `
+precision highp float;
+varying vec2 vUv;
+uniform float uTime;
+uniform float uOpacity;
+${NOISE}
+void main(){
+  float x = vUv.x, y = vUv.y;
+
+  // 多层竖流：向下坠落
+  float n1 = fbm(vec2(x * 13.0, y * 2.2 - uTime * 1.55));
+  float n2 = fbm(vec2(x * 38.0 + 4.0, y * 5.5 - uTime * 2.70));
+  float n3 = fbm(vec2(x * 86.0 + 9.0, y * 11.0 - uTime * 4.10));
+  float s = 0.58 * n1 + 0.42 * n2 + 0.22 * n3;
+  s = pow(clamp(s, 0.0, 1.0), 1.15);
+
+  // 水帘轮廓：上窄下宽、边缘晕散
+  float wid = 0.5 + 0.055 * (1.0 - y);
+  float axis = 0.5 + 0.012 * sin(y * 6.0 + uTime * 0.4);
+  float dx = abs(x - axis) / wid;
+  float edge = smoothstep(1.0, 0.30, dx);
+
+  // 上下渐隐：顶部融入山脊，底部散作水雾
+  float top = smoothstep(1.0, 0.90, y);
+  float bot = smoothstep(0.0, 0.14, y);
+
+  float a = edge * (0.16 + 0.92 * s) * top * bot;
+  a = clamp(a, 0.0, 1.0) * uOpacity;
+
+  // 墨色水骨 + 留白飞流
+  vec3 ink  = vec3(0.20, 0.21, 0.22);
+  vec3 foam = vec3(0.985, 0.982, 0.972);
+  vec3 col = mix(ink * 0.9, foam, smoothstep(0.16, 0.92, s));
+
+  gl_FragColor = vec4(col, a);
+}
+`;
+
+const fallVertUv = `
+varying vec2 vUv;
+void main(){
+  vUv = uv;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+const fallMats = [];
+function makeFall(w, h, x, y, z, order, opacity) {
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uTime: { value: 0 }, uOpacity: { value: opacity } },
+    vertexShader: fallVertUv,
+    fragmentShader: fallFrag,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+    side: THREE.DoubleSide
+  });
+  fallMats.push(mat);
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h, 1, 1), mat);
+  mesh.position.set(x, y, z);
+  mesh.renderOrder = order;
+  scene.add(mesh);
+  return mesh;
+}
+
+// 主瀑（自主峰倾泻入潭）
+makeFall(240, 1100, 0, -258, -690, 6, 0.98);
+// 侧瀑
+makeFall(70, 520, 430, -196, -688, 6, 0.55);
+makeFall(54, 430, -470, -212, -688, 6, 0.45);
+// 前层细流
+makeFall(38, 300, 250, -430, -232, 7, 0.38);
+
+/* ============ 潭水 / 江河 ============ */
+const waterFrag = `
+precision highp float;
+varying vec2 vUv;
+uniform float uTime;
+uniform vec3 uInk;
+uniform vec3 uPaper;
+${NOISE}
+void main(){
+  float x = vUv.x, y = vUv.y;
+
+  // 横向水流纹理，随时间向左奔流
+  float n1 = fbm(vec2(x * 4.5 - uTime * 0.42, y * 26.0));
+  float n2 = fbm(vec2(x * 11.0 - uTime * 0.75, y * 62.0 + 5.0));
+  float s = 0.6 * n1 + 0.4 * n2;
+
+  // 水纹：明暗交替的波纹线
+  float ripple = pow(clamp(s, 0.0, 1.0), 1.6);
+
+  // 近处（下方）墨重，远处化白
+  float depthTone = smoothstep(0.0, 0.85, y);
+
+  vec3 col = mix(uInk, uPaper, 0.30 + 0.62 * ripple);
+  float alpha = depthTone * (0.30 + 0.55 * ripple);
+
+  // 河岸两侧渐隐
+  alpha *= smoothstep(0.0, 0.10, x) * smoothstep(1.0, 0.90, x);
+
+  // 潭心泡沫（主瀑落点）
+  float pool = exp(-pow((x - 0.5) * 5.5, 2.0)) * smoothstep(0.72, 0.98, y);
+  float foam = fbm(vec2(x * 40.0 + uTime * 0.9, y * 40.0 - uTime * 0.7));
+  alpha += pool * foam * 0.55;
+  col = mix(col, uPaper, pool * foam * 0.9);
+
+  gl_FragColor = vec4(col, clamp(alpha, 0.0, 0.92));
+}
+`;
+
+const waterMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uTime: { value: 0 },
+    uInk: { value: new THREE.Color(0x3b3f42) },
+    uPaper: { value: new THREE.Color(0xefe9dc) }
+  },
+  vertexShader: fallVertUv,
+  fragmentShader: waterFrag,
+  transparent: true,
+  depthTest: false,
+  depthWrite: false
+});
+const waterMesh = new THREE.Mesh(new THREE.PlaneGeometry(4200, 560, 1, 1), waterMat);
+waterMesh.position.set(0, -700, -600);
+waterMesh.renderOrder = 4;
+scene.add(waterMesh);
+
+/* ============ 云气带（分层漂移） ============ */
+const cloudFrag = `
+precision highp float;
+varying vec2 vUv;
+uniform float uTime;
+uniform float uSeed;
+uniform float uOpacity;
+uniform vec3 uPaper;
+${NOISE}
+void main(){
+  float x = vUv.x, y = vUv.y;
+
+  float n = fbm(vec2(x * 2.6 + uSeed * 3.3 + uTime * 0.045, y * 5.0 - uSeed));
+  float n2 = fbm(vec2(x * 8.0 - uTime * 0.07, y * 12.0 + uSeed * 2.0));
+  float body = n * 0.7 + n2 * 0.3;
+
+  // 横向长条云
+  float band = smoothstep(0.62, 0.10, abs(y - 0.5));
+  float a = smoothstep(0.42, 0.72, body) * band * uOpacity;
+  a *= smoothstep(0.0, 0.16, x) * smoothstep(1.0, 0.84, x);
+
+  gl_FragColor = vec4(uPaper, a);
+}
+`;
+
+const cloudMats = [];
+function makeCloudBand(w, h, x, y, z, order, opacity, seed) {
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 }, uSeed: { value: seed }, uOpacity: { value: opacity },
+      uPaper: { value: new THREE.Color(0xf2ede2) }
+    },
+    vertexShader: fallVertUv,
+    fragmentShader: cloudFrag,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false
+  });
+  cloudMats.push(mat);
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h, 1, 1), mat);
+  mesh.position.set(x, y, z);
+  mesh.renderOrder = order;
+  scene.add(mesh);
+}
+
+makeCloudBand(5200, 620, 0, 120, -2100, 2, 0.62, 1.7);
+makeCloudBand(4000, 540, -120, -60, -1150, 3, 0.72, 5.2);
+makeCloudBand(2600, 420, 180, -430, -650, 5, 0.66, 9.4);
+makeCloudBand(2200, 300, -60, -640, -180, 6, 0.58, 13.8);
+
+/* ============ 苔点 / 树影（点景） ============ */
+const dotFrag = `
+precision highp float;
+varying vec2 vUv;
+uniform float uSeed;
+uniform float uOpacity;
+void main(){
+  vec2 p = vUv * 2.0 - 1.0;
+  float r = length(p);
+  float a = smoothstep(1.0, 0.35, r) * uOpacity;
+  gl_FragColor = vec4(vec3(0.16, 0.17, 0.16), a);
+}
+`;
+function makeDot(x, y, z, size, order, seed) {
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uSeed: { value: seed }, uOpacity: { value: 0.55 + Math.random() * 0.35 } },
+    vertexShader: fallVertUv,
+    fragmentShader: dotFrag,
+    transparent: true, depthTest: false, depthWrite: false
+  });
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(size, size * 0.72, 1, 1), mat);
+  m.position.set(x, y, z);
+  m.renderOrder = order;
+  scene.add(m);
+}
+for (let i = 0; i < 90; i++) {
+  const near = Math.random() < 0.55;
+  const zz = near ? -600 + Math.random() * 340 : -2200 + Math.random() * 900;
+  const xx = (Math.random() - 0.5) * (near ? 3200 : 5200);
+  const yy = near ? -820 + Math.random() * 520 : -560 + Math.random() * 700;
+  makeDot(xx, yy, zz, near ? 9 + Math.random() * 14 : 6 + Math.random() * 9,
+          near ? 7 : 3, i);
+}
+
+/* ============ 飞鸟 ============ */
+const birdFrag = `
+precision highp float;
+varying vec2 vUv;
+void main(){
+  vec2 p = vUv * 2.0 - 1.0;
+  // 两笔飞白构成 "人" 字形鸟
+  float w1 = smoothstep(0.055, 0.0, abs(p.y - abs(p.x) * 0.55 - 0.02)) * smoothstep(1.0, 0.05, abs(p.x));
+  float a = w1 * 0.85;
+  gl_FragColor = vec4(vec3(0.15, 0.15, 0.15), a);
+}
+`;
+const birds = [];
+for (let i = 0; i < 11; i++) {
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {}, vertexShader: fallVertUv, fragmentShader: birdFrag,
+    transparent: true, depthTest: false, depthWrite: false
+  });
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(34 + Math.random() * 26, 20 + Math.random() * 14, 1, 1), mat);
+  m.position.set((Math.random() - 0.5) * 2400, 240 + Math.random() * 420, -1500 + Math.random() * 800);
+  m.userData = {
+    speed: 12 + Math.random() * 16,
+    phase: Math.random() * 100,
+    baseY: m.position.y
+  };
+  m.renderOrder = 3;
+  scene.add(m);
+  birds.push(m);
+}
+
+/* ============ 交互：轻微视差 ============ */
+const pointer = { x: 0, y: 0, tx: 0, ty: 0 };
+window.addEventListener('pointermove', e => {
+  pointer.tx = (e.clientX / window.innerWidth - 0.5) * 2;
+  pointer.ty = (e.clientY / window.innerHeight - 0.5) * 2;
+});
+window.addEventListener('touchmove', e => {
+  if (!e.touches.length) return;
+  pointer.tx = (e.touches[0].clientX / window.innerWidth - 0.5) * 2;
+  pointer.ty = (e.touches[0].clientY / window.innerHeight - 0.5) * 2;
+}, { passive: true });
+
+/* ============ 动画 ============ */
+const clock = new THREE.Clock();
+let t = 0;
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  t += dt;
+
+  // 着色器时间
+  for (const m of mountainMeshes) m.material.uniforms.uTime.value = t;
+  for (const m of fallMats) m.uniforms.uTime.value = t;
+  for (const m of cloudMats) m.uniforms.uTime.value = t;
+  waterMat.uniforms.uTime.value = t;
+
+  // 缓动视差：远层位移小，近层位移大
+  pointer.x += (pointer.tx - pointer.x) * 0.035;
+  pointer.y += (pointer.ty - pointer.y) * 0.035;
+
+  const camX = pointer.x * 120;
+  const camY = -pointer.y * 60;
+  camera.position.x += (camX - camera.position.x) * 0.06;
+  camera.position.y += (camY - camera.position.y) * 0.06;
+  // 极缓的横向巡游，如展卷
+  camera.position.x += Math.sin(t * 0.075) * 0.35;
+  camera.lookAt(0, -60, -600);
+
+  // 视差分层（层越近位移越大）
+  for (let i = 0; i < mountainMeshes.length; i++) {
+    const k = 0.16 + i * 0.10;
+    mountainMeshes[i].position.x = -pointer.x * 60 * k;
+    mountainMeshes[i].position.y = layers[i].y + pointer.y * 18 * k;
+  }
+
+  // 飞鸟横掠，翼有起伏
+  for (const b of birds) {
+    b.position.x += b.userData.speed * dt;
+    b.position.y = b.userData.baseY + Math.sin(t * 1.4 + b.userData.phase) * 10;
+    b.rotation.z = Math.sin(t * 2.2 + b.userData.phase) * 0.10;
+    if (b.position.x > 1400) {
+      b.position.x = -1400;
+      b.userData.baseY = 240 + Math.random() * 420;
+    }
+  }
+
+  renderer.render(scene, camera);
+}
+animate();
+
+/* ============ 自适应 ============ */
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
